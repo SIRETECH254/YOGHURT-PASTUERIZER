@@ -71,26 +71,6 @@ void updateDisplay(float currentTemp, int stateCode) {
         u8g2.drawStr(4, 29, "1: HEAT   2: COOL");
         u8g2.drawStr(4, 45, "3: MIX    4: HOLD");
       }
-      else if (currentMenuState == SCREEN_RESUME_PROMPT) {
-        u8g2.drawStr(2, 11, "  POWER LOSS DETECTED");
-        u8g2.drawHLine(0, 15, 128);
-
-        u8g2.setCursor(4, 27);
-        u8g2.print("PHASE: ");
-        if (pendingResumeState == HEATING) u8g2.print("HEATING");
-        else if (pendingResumeState == COOLING) u8g2.print("COOLING");
-        else if (pendingResumeState == MIXING) u8g2.print("MIXING");
-        else if (pendingResumeState == HOLDING) u8g2.print("HOLDING");
-
-        u8g2.setCursor(4, 39);
-        u8g2.print("OFF FOR: ");
-        char tBuf[9];
-        formatTimeStr(tBuf, pendingResumeOutageMs);
-        u8g2.print(tBuf);
-
-        u8g2.drawStr(4, 51, "[#] RESUME");
-        u8g2.drawStr(4, 60, "[*] START OVER");
-      }
       else if (currentMenuState == SCREEN_MANUAL_READY) {
         u8g2.drawStr(2, 11, "   MANUAL READY");
         u8g2.setCursor(4, 29);

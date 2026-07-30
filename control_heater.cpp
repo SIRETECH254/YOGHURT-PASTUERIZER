@@ -59,7 +59,7 @@ void turnOffAllActuators() {
 // won't turn back on until the temp drops a further 1C below that point --
 // a small amount of noise can no longer re-trigger it.
 // -------------------------------------------------------------------------
-const float HEAT_CUTOFF_BAND = 10.0; // Heater goes full OFF this many degrees before target
+const float HEAT_CUTOFF_BAND = 15.0; // Heater goes full OFF this many degrees before target
 const float HEAT_HYSTERESIS = 1.0;   // Dead zone below the cutoff before the heater is allowed back on
 
 void runPIDControl(float currentTemp, float targetTemp) {
@@ -92,7 +92,7 @@ void runPIDControl(float currentTemp, float targetTemp) {
 // target. Same hysteresis logic as runPIDControl() above, for the same
 // chatter-prevention reason.
 // -------------------------------------------------------------------------
-const float COOL_CUTOFF_BAND = 7.0;  // Cooling valve goes full OFF this many degrees before target
+const float COOL_CUTOFF_BAND = 10.0; // Cooling valve goes full OFF this many degrees before target
 const float COOL_HYSTERESIS = 1.0;   // Dead zone below the cutoff before the valve is allowed back on
 
 void runCoolingControl(float currentTemp, float targetTemp) {

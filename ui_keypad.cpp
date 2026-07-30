@@ -26,15 +26,6 @@ ProcessState selectedManualState = SYSTEM_IDLE;
 String inputBuffer = "";
 int settingCursor = 0; // 0 = Temp, 1 = Time Duration
 
-// Pending resume-after-power-loss data, staged by setup() before the
-// operator has confirmed anything on SCREEN_RESUME_PROMPT
-ProcessState pendingResumeState = SYSTEM_IDLE;
-OperationMode pendingResumeMode = MODE_NONE;
-ProcessState pendingResumeManual = SYSTEM_IDLE;
-bool pendingResumeTimerActive = false;
-unsigned long pendingResumeElapsedMs = 0;
-unsigned long pendingResumeOutageMs = 0;
-
 // Default Factory Settings
 float TARGET_HEAT_TEMP = 85.0;
 unsigned long HEAT_DUR_MS = 0; // 0 Minutes
@@ -73,12 +64,6 @@ void processKeypadDigits() {
   // Global exit/back key logic map
   if (key == '*') {
     inputBuffer = "";
-    if (currentMenuState == SCREEN_RESUME_PROMPT) {
-      // Operator declined -- discard the saved run and boot fresh
-      clearRunState();
-      currentMenuState = SCREEN_HOME;
-      return;
-    }
     if (currentMenuState == SCREEN_SETTINGS_MAIN || currentMenuState == SCREEN_AUTO_READY || currentMenuState == SCREEN_MANUAL_MENU) {
       currentMenuState = SCREEN_HOME;
     } else if (currentMenuState == SCREEN_MANUAL_READY) {
@@ -157,26 +142,5 @@ void processKeypadDigits() {
       }
       break;
 
-    case SCREEN_RESUME_PROMPT:
-      if (key == '#') {
-        // Operator confirmed: apply the staged resume data
-        currentMode = pendingResumeMode;
-        selectedManualState = pendingResumeManual;
-        currentState = pendingResumeState;
-        currentMenuState = SCREEN_RUNNING;
-
-        if (pendingResumeTimerActive) {
-          // The countdown had already started before power loss -- restore
-          // it relative to the new millis() clock so remaining time is correct.
-          phaseTimerActive = true;
-          phaseStartTime = millis() - pendingResumeElapsedMs;
-        } else {
-          // Countdown hadn't started yet -- let the normal "reached temp"
-          // check in loop() re-arm it naturally.
-          phaseTimerActive = false;
-        }
-      }
-      // '*' (decline) is handled by the global exit/back key logic above
-      break;
   }
 }

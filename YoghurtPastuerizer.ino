@@ -22,16 +22,23 @@ void setup() {
 
   loadSettings(); // Pull in any previously saved temps/durations, overriding the compiled defaults
 
-  // Check for a run that was interrupted by a power loss. Don't resume
-  // automatically -- stage the data and let the operator confirm on the
-  // LCD, since an unattended multi-hour outage may mean the product can no
-  // longer be trusted to just pick back up where it left off.
-  if (loadRunState(pendingResumeState, pendingResumeMode, pendingResumeManual,
-                    pendingResumeTimerActive, pendingResumeElapsedMs, pendingResumeOutageMs)) {
-    Serial.print("MEMORY: Found interrupted run. Outage was approx ");
-    Serial.print(pendingResumeOutageMs / 1000);
-    Serial.println("s. Awaiting operator confirmation.");
-    currentMenuState = SCREEN_RESUME_PROMPT;
+  // Auto-resume any run interrupted by a power loss.
+  ProcessState resumeState; OperationMode resumeMode; ProcessState resumeManual;
+  bool resumeTimerActive; unsigned long resumeElapsedMs; unsigned long resumeOutageMs;
+  if (loadRunState(resumeState, resumeMode, resumeManual, resumeTimerActive, resumeElapsedMs, resumeOutageMs)) {
+    Serial.print("MEMORY: Auto-resuming interrupted run. Outage was approx ");
+    Serial.print(resumeOutageMs / 1000);
+    Serial.println("s.");
+    currentMode             = resumeMode;
+    selectedManualState     = resumeManual;
+    currentState            = resumeState;
+    currentMenuState        = SCREEN_RUNNING;
+    if (resumeTimerActive) {
+      phaseTimerActive = true;
+      phaseStartTime   = millis() - resumeElapsedMs;
+    } else {
+      phaseTimerActive = false;
+    }
   }
 }
 
@@ -163,75 +170,62 @@ void loop() {
       static unsigned long holdingCycleStart = 0;
       static unsigned long heaterOnDuration = 0;
       static unsigned long coolerOnDuration = 0;
-      
+
       unsigned long now = millis();
+      float error    = TARGET_HOLD_TEMP - coolTemp;
+      float absError = abs(error);
 
-      // Check if we need to start a new 1-minute duty control cycle
-      if (holdingCycleStart == 0 || (now - holdingCycleStart >= 60000)) {
-        holdingCycleStart = now;
-        
-        float error = TARGET_HOLD_TEMP - coolTemp;
-        
-        // Reset durations
-        heaterOnDuration = 0;
-        coolerOnDuration = 0;
-
-        // Stepped correction table: below HOLD_TIER1_C is the rest/deadband
-        // zone, then each tier fires a fixed pulse length. No scaling between
-        // tiers -- just the flat value for whichever band the deviation falls in.
-        const float HOLD_TIER1_C = 2.5;                 // >= this deviation: short nudge
-        const float HOLD_TIER2_C = 4.0;                 // >= this deviation: medium pulse
-        const float HOLD_TIER3_C = 6.0;                 // >= this deviation: max pulse
-        const unsigned long HOLD_TIER1_MS = 5000;        // 5s
-        const unsigned long HOLD_TIER2_MS = 15000;       // 15s
-        const unsigned long HOLD_TIER3_MS = 25000;       // 25s
-
-        float absError = abs(error);
-        unsigned long pulseDuration = 0; // stays 0 -> rest if below HOLD_TIER1_C
-
-        if (absError >= HOLD_TIER3_C) {
-          pulseDuration = HOLD_TIER3_MS;
-        } else if (absError >= HOLD_TIER2_C) {
-          pulseDuration = HOLD_TIER2_MS;
-        } else if (absError >= HOLD_TIER1_C) {
-          pulseDuration = HOLD_TIER1_MS;
-        }
-
-        if (pulseDuration == 0) {
-          Serial.println("HOLD: Temperature stable. Rest cycle.");
-        }
-        else if (error > 0) {
-          // Milk is cold: pulse HEATER for this tier's fixed duration
-          heaterOnDuration = pulseDuration;
-          Serial.print("HOLD: Under target. Pulsing HEATER for ");
-          Serial.print(pulseDuration / 1000);
-          Serial.println("s.");
+      if (absError >= 7.0) {
+        // CONTINUOUS mode: deviation too large for duty cycling, run actuator flat-out
+        holdingCycleStart = 0; // force duty-cycle to restart fresh once we drop below 7C
+        if (error > 0) {
+          digitalWrite(RELAY_HEATER_PIN, LOW);   // Heater ON
+          digitalWrite(RELAY_COOLING_PIN, HIGH); // Cooler OFF
+          Serial.println("HOLD: >7C under target. Continuous HEAT.");
         } else {
-          // Milk is hot: pulse COOLING valve for this tier's fixed duration
-          coolerOnDuration = pulseDuration;
-          Serial.print("HOLD: Over target. Pulsing COOLING for ");
-          Serial.print(pulseDuration / 1000);
-          Serial.println("s.");
+          digitalWrite(RELAY_HEATER_PIN, HIGH);  // Heater OFF
+          digitalWrite(RELAY_COOLING_PIN, LOW);  // Cooler ON
+          Serial.println("HOLD: >7C over target. Continuous COOL.");
         }
-      }
+      } else {
+        // DUTY-CYCLE mode: proportional pulse within a 60s window
+        if (holdingCycleStart == 0 || (now - holdingCycleStart >= 60000)) {
+          holdingCycleStart = now;
+          heaterOnDuration  = 0;
+          coolerOnDuration  = 0;
 
-      // Execute calculated duty cycles within the active 1-minute window
-      unsigned long cycleProgress = now - holdingCycleStart;
+          unsigned long pulseDuration = 0;
+          if      (absError >= 5.0) pulseDuration = 30000; // 30s
+          else if (absError >= 3.0) pulseDuration = 20000; // 20s
+          else if (absError >= 2.0) pulseDuration = 10000; // 10s
+          // < 2C -> rest
 
-      if (heaterOnDuration > 0 && cycleProgress < heaterOnDuration) {
-        // Run Heater Burst
-        digitalWrite(RELAY_HEATER_PIN, LOW);     // Heater ON
-        digitalWrite(RELAY_COOLING_PIN, HIGH);   // Cooler OFF
-      } 
-      else if (coolerOnDuration > 0 && cycleProgress < coolerOnDuration) {
-        // Run Cooler Burst
-        digitalWrite(RELAY_HEATER_PIN, HIGH);    // Heater OFF
-        digitalWrite(RELAY_COOLING_PIN, LOW);     // Cooler ON
-      } 
-      else {
-        // Rest state for the remainder of the 1-minute cycle (resulting in 25s of rest if duty was 35s)
-        digitalWrite(RELAY_HEATER_PIN, HIGH);    // Heater OFF
-        digitalWrite(RELAY_COOLING_PIN, HIGH);   // Cooler OFF
+          if (pulseDuration == 0) {
+            Serial.println("HOLD: Within 2C. Rest cycle.");
+          } else if (error > 0) {
+            heaterOnDuration = pulseDuration;
+            Serial.print("HOLD: Under target. Pulsing HEATER for ");
+            Serial.print(pulseDuration / 1000);
+            Serial.println("s.");
+          } else {
+            coolerOnDuration = pulseDuration;
+            Serial.print("HOLD: Over target. Pulsing COOLING for ");
+            Serial.print(pulseDuration / 1000);
+            Serial.println("s.");
+          }
+        }
+
+        unsigned long cycleProgress = now - holdingCycleStart;
+        if (heaterOnDuration > 0 && cycleProgress < heaterOnDuration) {
+          digitalWrite(RELAY_HEATER_PIN, LOW);   // Heater ON
+          digitalWrite(RELAY_COOLING_PIN, HIGH); // Cooler OFF
+        } else if (coolerOnDuration > 0 && cycleProgress < coolerOnDuration) {
+          digitalWrite(RELAY_HEATER_PIN, HIGH);  // Heater OFF
+          digitalWrite(RELAY_COOLING_PIN, LOW);  // Cooler ON
+        } else {
+          digitalWrite(RELAY_HEATER_PIN, HIGH);  // Heater OFF
+          digitalWrite(RELAY_COOLING_PIN, HIGH); // Cooler OFF
+        }
       }
       
       // Countdown time handling
