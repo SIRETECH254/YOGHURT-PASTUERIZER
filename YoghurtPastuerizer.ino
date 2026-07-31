@@ -59,8 +59,19 @@ void transitionToNextState(ProcessState nextAutoState) {
 }
 
 void loop() {
-  float heatTemp = readHeatingTemperature(); 
-  float coolTemp = readCoolingTemperature(); 
+  float heatTemp = readHeatingTemperature();
+  float coolTemp = readCoolingTemperature();
+
+  // Once-per-second serial telemetry so you can watch jacket-vs-product on the monitor
+  static unsigned long lastTempLog = 0;
+  if (millis() - lastTempLog >= 1000) {
+    lastTempLog = millis();
+    Serial.print("JACKET [A1]: ");
+    Serial.print(heatTemp, 1);
+    Serial.print(" C  |  PRODUCT [A0]: ");
+    Serial.print(coolTemp, 1);
+    Serial.println(" C");
+  }
 
   // Track consecutive sensor faults to filter out single-frame EMI relay noise spikes
   static int consecutiveFaults = 0;
@@ -109,11 +120,13 @@ void loop() {
       turnOnAgitator();                       // Agitator ON during heating to ensure uniform mixture
       digitalWrite(RELAY_COOLING_PIN, HIGH);  // Force Cooling Valve OFF
       
-      runPIDControl(coolTemp, TARGET_HEAT_TEMP); 
-      
-      // Safety Override: Throttle/turn off heater if jacket gets too hot, but DO NOT fault brick the machine
+      // Jacket-driven maintenance: heater cycles to hold jacket at TARGET_HEAT_TEMP.
+      // Product asymptotes to that temp with zero overshoot (heat only flows hot -> cold).
+      runPIDControl(heatTemp, TARGET_HEAT_TEMP);
+
+      // Safety backstop: cut heater if jacket exceeds the absolute safety ceiling.
       if (heatTemp >= (MAX_SAFE_TEMP - 5.0)) {
-        turnOffHeater(); 
+        turnOffHeater();
       }
 
       if (!phaseTimerActive) {
@@ -132,7 +145,9 @@ void loop() {
       // ACTUATOR: COOLING VALVE ONLY
       turnOffHeater();                        // Force Heater OFF
       digitalWrite(RELAY_AGITATOR_PIN, HIGH); // Force Agitator OFF
-      runCoolingControl(coolTemp, TARGET_COOL_TEMP); // Taper valve near target to prevent undershoot
+      // Jacket-driven maintenance: valve cycles to hold jacket at TARGET_COOL_TEMP.
+      // Product asymptotes down to that temp with zero undershoot.
+      runCoolingControl(heatTemp, TARGET_COOL_TEMP);
       
       if (!phaseTimerActive) {
         if (coolTemp <= TARGET_COOL_TEMP) {
@@ -163,78 +178,39 @@ void loop() {
       break;
         
     case HOLDING:
-    { // Scope bracket to isolate local variables and fix compile warnings
-      // ACTUATORS: HEATER AND COOLER ONLY (MAINTAINING TEMPERATURE VIA TIME DUTY-CYCLE)
+    { // Scope bracket -- required so the local declarations below don't "jump" past following case labels
+      // ACTUATORS: HEATER AND COOLER (jacket-driven bidirectional maintenance)
       digitalWrite(RELAY_AGITATOR_PIN, HIGH); // Force Agitator OFF
 
-      static unsigned long holdingCycleStart = 0;
-      static unsigned long heaterOnDuration = 0;
-      static unsigned long coolerOnDuration = 0;
-
-      unsigned long now = millis();
-      float error    = TARGET_HOLD_TEMP - coolTemp;
-      float absError = abs(error);
-
-      if (absError >= 7.0) {
-        // CONTINUOUS mode: deviation too large for duty cycling, run actuator flat-out
-        holdingCycleStart = 0; // force duty-cycle to restart fresh once we drop below 7C
-        if (error > 0) {
-          digitalWrite(RELAY_HEATER_PIN, LOW);   // Heater ON
-          digitalWrite(RELAY_COOLING_PIN, HIGH); // Cooler OFF
-          Serial.println("HOLD: >7C under target. Continuous HEAT.");
-        } else {
-          digitalWrite(RELAY_HEATER_PIN, HIGH);  // Heater OFF
-          digitalWrite(RELAY_COOLING_PIN, LOW);  // Cooler ON
-          Serial.println("HOLD: >7C over target. Continuous COOL.");
-        }
+      // Rest zone with hysteresis: enter rest at +/- 3C, only exit at +/- 5C.
+      // The 2C dead band between entry and exit is what stops relay flicker at the
+      // boundary -- without it, probe noise (~0.5C EMI wobble) would flip the state
+      // on every loop iteration. Small drifts self-correct via ambient equilibrium.
+      static bool inRestZone = true;
+      float holdDev = fabs(heatTemp - TARGET_HOLD_TEMP);
+      if (inRestZone) {
+        if (holdDev > 5.0) inRestZone = false; // Drifted far enough to need active correction
       } else {
-        // DUTY-CYCLE mode: proportional pulse within a 60s window
-        if (holdingCycleStart == 0 || (now - holdingCycleStart >= 60000)) {
-          holdingCycleStart = now;
-          heaterOnDuration  = 0;
-          coolerOnDuration  = 0;
-
-          unsigned long pulseDuration = 0;
-          if      (absError >= 5.0) pulseDuration = 30000; // 30s
-          else if (absError >= 3.0) pulseDuration = 20000; // 20s
-          else if (absError >= 2.0) pulseDuration = 10000; // 10s
-          // < 2C -> rest
-
-          if (pulseDuration == 0) {
-            Serial.println("HOLD: Within 2C. Rest cycle.");
-          } else if (error > 0) {
-            heaterOnDuration = pulseDuration;
-            Serial.print("HOLD: Under target. Pulsing HEATER for ");
-            Serial.print(pulseDuration / 1000);
-            Serial.println("s.");
-          } else {
-            coolerOnDuration = pulseDuration;
-            Serial.print("HOLD: Over target. Pulsing COOLING for ");
-            Serial.print(pulseDuration / 1000);
-            Serial.println("s.");
-          }
-        }
-
-        unsigned long cycleProgress = now - holdingCycleStart;
-        if (heaterOnDuration > 0 && cycleProgress < heaterOnDuration) {
-          digitalWrite(RELAY_HEATER_PIN, LOW);   // Heater ON
-          digitalWrite(RELAY_COOLING_PIN, HIGH); // Cooler OFF
-        } else if (coolerOnDuration > 0 && cycleProgress < coolerOnDuration) {
-          digitalWrite(RELAY_HEATER_PIN, HIGH);  // Heater OFF
-          digitalWrite(RELAY_COOLING_PIN, LOW);  // Cooler ON
-        } else {
-          digitalWrite(RELAY_HEATER_PIN, HIGH);  // Heater OFF
-          digitalWrite(RELAY_COOLING_PIN, HIGH); // Cooler OFF
-        }
+        if (holdDev <= 3.0) inRestZone = true; // Back inside tolerance
       }
-      
+
+      if (inRestZone) {
+        turnOffHeater();
+        turnOffCoolingValve();
+      } else if (heatTemp < TARGET_HOLD_TEMP) {
+        turnOffCoolingValve();
+        runPIDControl(heatTemp, TARGET_HOLD_TEMP);
+      } else {
+        turnOffHeater();
+        runCoolingControl(heatTemp, TARGET_HOLD_TEMP);
+      }
+
       // Countdown time handling
       if (!phaseTimerActive) {
-        // Once temperature is within +/- 2.0C of target, initiate holding time clock
+        // Once product temperature is within +/- 2.0C of target, initiate holding time clock
         if (coolTemp >= TARGET_HOLD_TEMP - 2.0 && coolTemp <= TARGET_HOLD_TEMP + 2.0) {
            phaseTimerActive = true;
            phaseStartTime = millis();
-           holdingCycleStart = millis(); // Reset cycle baseline
         }
       } else {
         if (millis() - phaseStartTime >= HOLD_DUR_MS) {

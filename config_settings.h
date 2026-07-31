@@ -13,8 +13,9 @@
 #define RELAY_COOLING_PIN  9   
 
 // Dedicated 3-Pin Analog Sensor Allocation Maps
-#define ANALOG_HEAT_PIN    A0  // For Heating Jacket Temperature Probe
-#define ANALOG_COOL_PIN    A1  // For Inner Cooling Vessel Temperature Probe (Product)
+// NOTE: pins swapped from the original A0/A1 assignment to match the physical wiring.
+#define ANALOG_HEAT_PIN    A1  // For Heating Jacket Temperature Probe
+#define ANALOG_COOL_PIN    A0  // For Inner Cooling Vessel Temperature Probe (Product)
 
 // Keypad Configuration Matrix Pins
 #define KEYPAD_ROWS 4

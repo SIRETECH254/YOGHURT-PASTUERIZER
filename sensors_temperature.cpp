@@ -73,14 +73,14 @@ void runSensorDiagnostics() {
   float testCool = convertAnalogToThermistor(ANALOG_COOL_PIN);
   
   if (testHeat == 999.0) {
-    Serial.println("HEATING JACKET PROBE [A0]: FAULT");
+    Serial.println("HEATING JACKET PROBE [A1]: FAULT");
   } else {
-    Serial.print("HEATING JACKET PROBE [A0]: "); Serial.print(testHeat + HEAT_PROBE_OFFSET, 1); Serial.println(" C");
+    Serial.print("HEATING JACKET PROBE [A1]: "); Serial.print(testHeat + HEAT_PROBE_OFFSET, 1); Serial.println(" C");
   }
   
   if (testCool == 999.0) {
-    Serial.println("PRODUCT COOLING PROBE [A1]: FAULT");
+    Serial.println("PRODUCT COOLING PROBE [A0]: FAULT");
   } else {
-    Serial.print("PRODUCT COOLING PROBE [A1]: "); Serial.print(testCool + COOL_PROBE_OFFSET, 1); Serial.println(" C");
+    Serial.print("PRODUCT COOLING PROBE [A0]: "); Serial.print(testCool + COOL_PROBE_OFFSET, 1); Serial.println(" C");
   }
 }

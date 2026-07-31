@@ -9,6 +9,7 @@ void runPIDControl(float currentTemp, float targetTemp);
 void runCoolingControl(float currentTemp, float targetTemp);
 void turnOffHeater();
 void turnOnCoolingValve();
+void turnOffCoolingValve();
 void turnOffAllActuators();
 
 #endif
