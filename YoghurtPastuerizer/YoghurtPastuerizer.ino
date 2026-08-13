@@ -129,9 +129,9 @@ void loop() {
       break;
 
     case COOLING:
-      // ACTUATOR: COOLING VALVE ONLY
+      // ACTUATORS: COOLING VALVE AND AGITATOR
       turnOffHeater();                        // Force Heater OFF
-      digitalWrite(RELAY_AGITATOR_PIN, HIGH); // Force Agitator OFF
+      turnOnAgitator();                       // Agitator ON during cooling to ensure uniform mixture
       runCoolingControl(coolTemp, TARGET_COOL_TEMP); // Taper valve near target to prevent undershoot
       
       if (!phaseTimerActive) {
@@ -170,22 +170,38 @@ void loop() {
       static unsigned long holdingCycleStart = 0;
       static unsigned long heaterOnDuration = 0;
       static unsigned long coolerOnDuration = 0;
+      static bool inContinuousMode = false;
+
+      // Continuous-drive boundary needs a hysteresis dead zone: this check runs every
+      // loop tick (~20Hz), unlike the duty-cycle tiers below which only re-evaluate once
+      // per 60s window. Without the dead zone, sensor noise sitting right at the threshold
+      // would rapidly flip the relay between continuous-drive and duty-cycle -- same class
+      // of chatter/wear that HEAT_HYSTERESIS/COOL_HYSTERESIS guard against in control_heater.cpp.
+      const float HOLD_CONTINUOUS_THRESHOLD  = 7.0;
+      const float HOLD_CONTINUOUS_HYSTERESIS = 0.5; // kept under the 1C tier width so it can't skip a whole tier
+      const float HOLD_REST_THRESHOLD        = 3.0;
 
       unsigned long now = millis();
       float error    = TARGET_HOLD_TEMP - coolTemp;
       float absError = abs(error);
 
-      if (absError >= 7.0) {
+      if (inContinuousMode) {
+        inContinuousMode = (absError >= HOLD_CONTINUOUS_THRESHOLD - HOLD_CONTINUOUS_HYSTERESIS);
+      } else {
+        inContinuousMode = (absError >= HOLD_CONTINUOUS_THRESHOLD);
+      }
+
+      if (inContinuousMode) {
         // CONTINUOUS mode: deviation too large for duty cycling, run actuator flat-out
-        holdingCycleStart = 0; // force duty-cycle to restart fresh once we drop below 7C
+        holdingCycleStart = 0; // force duty-cycle to restart fresh once we drop out of continuous mode
         if (error > 0) {
           digitalWrite(RELAY_HEATER_PIN, LOW);   // Heater ON
           digitalWrite(RELAY_COOLING_PIN, HIGH); // Cooler OFF
-          Serial.println("HOLD: >7C under target. Continuous HEAT.");
+          Serial.println("HOLD: >=7C under target. Continuous HEAT.");
         } else {
           digitalWrite(RELAY_HEATER_PIN, HIGH);  // Heater OFF
           digitalWrite(RELAY_COOLING_PIN, LOW);  // Cooler ON
-          Serial.println("HOLD: >7C over target. Continuous COOL.");
+          Serial.println("HOLD: >=7C over target. Continuous COOL.");
         }
       } else {
         // DUTY-CYCLE mode: proportional pulse within a 60s window
@@ -195,13 +211,14 @@ void loop() {
           coolerOnDuration  = 0;
 
           unsigned long pulseDuration = 0;
-          if      (absError >= 5.0) pulseDuration = 30000; // 30s
-          else if (absError >= 3.0) pulseDuration = 20000; // 20s
-          else if (absError >= 2.0) pulseDuration = 10000; // 10s
-          // < 2C -> rest
+          if      (absError >= 6.0) pulseDuration = 20000; // 20s
+          else if (absError >= 5.0) pulseDuration = 15000; // 15s
+          else if (absError >= 4.0) pulseDuration = 10000; // 10s
+          else if (absError >= HOLD_REST_THRESHOLD) pulseDuration = 5000; // 5s
+          // < 3C -> rest
 
           if (pulseDuration == 0) {
-            Serial.println("HOLD: Within 2C. Rest cycle.");
+            Serial.println("HOLD: Within 3C. Rest cycle.");
           } else if (error > 0) {
             heaterOnDuration = pulseDuration;
             Serial.print("HOLD: Under target. Pulsing HEATER for ");
