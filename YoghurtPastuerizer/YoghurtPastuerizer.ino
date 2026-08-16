@@ -109,7 +109,7 @@ void loop() {
       turnOnAgitator();                       // Agitator ON during heating to ensure uniform mixture
       digitalWrite(RELAY_COOLING_PIN, HIGH);  // Force Cooling Valve OFF
       
-      runPIDControl(coolTemp, TARGET_HEAT_TEMP); 
+      runPIDControl(heatTemp, TARGET_HEAT_TEMP);
       
       // Safety Override: Throttle/turn off heater if jacket gets too hot, but DO NOT fault brick the machine
       if (heatTemp >= (MAX_SAFE_TEMP - 5.0)) {
@@ -132,7 +132,7 @@ void loop() {
       // ACTUATORS: COOLING VALVE AND AGITATOR
       turnOffHeater();                        // Force Heater OFF
       turnOnAgitator();                       // Agitator ON during cooling to ensure uniform mixture
-      runCoolingControl(coolTemp, TARGET_COOL_TEMP); // Taper valve near target to prevent undershoot
+      runCoolingControl(heatTemp, TARGET_COOL_TEMP); // Jacket-driven: valve cuts off exactly at target
       
       if (!phaseTimerActive) {
         if (coolTemp <= TARGET_COOL_TEMP) {
@@ -163,95 +163,18 @@ void loop() {
       break;
         
     case HOLDING:
-    { // Scope bracket to isolate local variables and fix compile warnings
-      // ACTUATORS: HEATER AND COOLER ONLY (MAINTAINING TEMPERATURE VIA TIME DUTY-CYCLE)
+      // ACTUATORS: HEATER AND COOLER, CASCADE-CONTROLLED OFF THE JACKET PROBE
+      // (see runHoldingControl() in control_heater.cpp for why this replaced
+      // the old product-probe-only duty-cycle timer)
       digitalWrite(RELAY_AGITATOR_PIN, HIGH); // Force Agitator OFF
+      runHoldingControl(heatTemp, coolTemp, TARGET_HOLD_TEMP);
 
-      static unsigned long holdingCycleStart = 0;
-      static unsigned long heaterOnDuration = 0;
-      static unsigned long coolerOnDuration = 0;
-      static bool inContinuousMode = false;
-
-      // Continuous-drive boundary needs a hysteresis dead zone: this check runs every
-      // loop tick (~20Hz), unlike the duty-cycle tiers below which only re-evaluate once
-      // per 60s window. Without the dead zone, sensor noise sitting right at the threshold
-      // would rapidly flip the relay between continuous-drive and duty-cycle -- same class
-      // of chatter/wear that HEAT_HYSTERESIS/COOL_HYSTERESIS guard against in control_heater.cpp.
-      const float HOLD_CONTINUOUS_THRESHOLD  = 7.0;
-      const float HOLD_CONTINUOUS_HYSTERESIS = 0.5; // kept under the 1C tier width so it can't skip a whole tier
-      const float HOLD_REST_THRESHOLD        = 3.0;
-
-      unsigned long now = millis();
-      float error    = TARGET_HOLD_TEMP - coolTemp;
-      float absError = abs(error);
-
-      if (inContinuousMode) {
-        inContinuousMode = (absError >= HOLD_CONTINUOUS_THRESHOLD - HOLD_CONTINUOUS_HYSTERESIS);
-      } else {
-        inContinuousMode = (absError >= HOLD_CONTINUOUS_THRESHOLD);
-      }
-
-      if (inContinuousMode) {
-        // CONTINUOUS mode: deviation too large for duty cycling, run actuator flat-out
-        holdingCycleStart = 0; // force duty-cycle to restart fresh once we drop out of continuous mode
-        if (error > 0) {
-          digitalWrite(RELAY_HEATER_PIN, LOW);   // Heater ON
-          digitalWrite(RELAY_COOLING_PIN, HIGH); // Cooler OFF
-          Serial.println("HOLD: >=7C under target. Continuous HEAT.");
-        } else {
-          digitalWrite(RELAY_HEATER_PIN, HIGH);  // Heater OFF
-          digitalWrite(RELAY_COOLING_PIN, LOW);  // Cooler ON
-          Serial.println("HOLD: >=7C over target. Continuous COOL.");
-        }
-      } else {
-        // DUTY-CYCLE mode: proportional pulse within a 60s window
-        if (holdingCycleStart == 0 || (now - holdingCycleStart >= 60000)) {
-          holdingCycleStart = now;
-          heaterOnDuration  = 0;
-          coolerOnDuration  = 0;
-
-          unsigned long pulseDuration = 0;
-          if      (absError >= 6.0) pulseDuration = 20000; // 20s
-          else if (absError >= 5.0) pulseDuration = 15000; // 15s
-          else if (absError >= 4.0) pulseDuration = 10000; // 10s
-          else if (absError >= HOLD_REST_THRESHOLD) pulseDuration = 5000; // 5s
-          // < 3C -> rest
-
-          if (pulseDuration == 0) {
-            Serial.println("HOLD: Within 3C. Rest cycle.");
-          } else if (error > 0) {
-            heaterOnDuration = pulseDuration;
-            Serial.print("HOLD: Under target. Pulsing HEATER for ");
-            Serial.print(pulseDuration / 1000);
-            Serial.println("s.");
-          } else {
-            coolerOnDuration = pulseDuration;
-            Serial.print("HOLD: Over target. Pulsing COOLING for ");
-            Serial.print(pulseDuration / 1000);
-            Serial.println("s.");
-          }
-        }
-
-        unsigned long cycleProgress = now - holdingCycleStart;
-        if (heaterOnDuration > 0 && cycleProgress < heaterOnDuration) {
-          digitalWrite(RELAY_HEATER_PIN, LOW);   // Heater ON
-          digitalWrite(RELAY_COOLING_PIN, HIGH); // Cooler OFF
-        } else if (coolerOnDuration > 0 && cycleProgress < coolerOnDuration) {
-          digitalWrite(RELAY_HEATER_PIN, HIGH);  // Heater OFF
-          digitalWrite(RELAY_COOLING_PIN, LOW);  // Cooler ON
-        } else {
-          digitalWrite(RELAY_HEATER_PIN, HIGH);  // Heater OFF
-          digitalWrite(RELAY_COOLING_PIN, HIGH); // Cooler OFF
-        }
-      }
-      
       // Countdown time handling
       if (!phaseTimerActive) {
         // Once temperature is within +/- 2.0C of target, initiate holding time clock
         if (coolTemp >= TARGET_HOLD_TEMP - 2.0 && coolTemp <= TARGET_HOLD_TEMP + 2.0) {
            phaseTimerActive = true;
            phaseStartTime = millis();
-           holdingCycleStart = millis(); // Reset cycle baseline
         }
       } else {
         if (millis() - phaseStartTime >= HOLD_DUR_MS) {
@@ -259,8 +182,7 @@ void loop() {
         }
       }
       break;
-    } // Close scope bracket
-        
+
     case COMPLETE:
       turnOffAllActuators();
       soundBuzzer();
@@ -288,6 +210,50 @@ void loop() {
       unsigned long elapsed = phaseTimerActive ? (millis() - phaseStartTime) : 0;
       saveRunState(currentState, currentMode, selectedManualState, phaseTimerActive, elapsed);
     }
+  }
+
+  // Periodic Serial heartbeat -- HEATING/COOLING/MIXING/HOLDING don't otherwise
+  // print anything during normal operation, so without this the monitor shows
+  // only the one-time setup() diagnostics and then goes silent.
+  static unsigned long lastHeartbeat = 0;
+  if (millis() - lastHeartbeat >= 1000) {
+    lastHeartbeat = millis();
+
+    // Elapsed time into the current phase's duration countdown (0 until the
+    // phase's own start condition is met, e.g. HOLDING waits for +/-2C first)
+    // rather than raw seconds-since-boot -- much more useful for an 8-hour hold.
+    unsigned long phaseElapsedSec = phaseTimerActive ? (millis() - phaseStartTime) / 1000 : 0;
+    unsigned long hh = phaseElapsedSec / 3600;
+    unsigned long mm = (phaseElapsedSec % 3600) / 60;
+    unsigned long ss = phaseElapsedSec % 60;
+
+    // Relays are active-low; digitalRead() on an OUTPUT pin reads back what
+    // we last wrote, so this reflects the actual actuator state right now.
+    bool heaterOn   = (digitalRead(RELAY_HEATER_PIN)   == LOW);
+    bool coolerOn   = (digitalRead(RELAY_COOLING_PIN)  == LOW);
+    bool agitatorOn = (digitalRead(RELAY_AGITATOR_PIN) == LOW);
+
+    Serial.print("[state=");
+    Serial.print(currentState);
+    Serial.print(" phase_elapsed=");
+    if (hh < 10) Serial.print('0');
+    Serial.print(hh);
+    Serial.print(':');
+    if (mm < 10) Serial.print('0');
+    Serial.print(mm);
+    Serial.print(':');
+    if (ss < 10) Serial.print('0');
+    Serial.print(ss);
+    Serial.print("] jacket=");
+    Serial.print(heatTemp, 1);
+    Serial.print("C product=");
+    Serial.print(coolTemp, 1);
+    Serial.print("C | HEATER=");
+    Serial.print(heaterOn ? "ON" : "off");
+    Serial.print(" COOLER=");
+    Serial.print(coolerOn ? "ON" : "off");
+    Serial.print(" AGITATOR=");
+    Serial.println(agitatorOn ? "ON" : "off");
   }
 
   updateDisplay(coolTemp, (int)currentState);
