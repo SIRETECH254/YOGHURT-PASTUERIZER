@@ -171,8 +171,8 @@ void loop() {
 
       // Countdown time handling
       if (!phaseTimerActive) {
-        // Once temperature is within +/- 2.0C of target, initiate holding time clock
-        if (coolTemp >= TARGET_HOLD_TEMP - 2.0 && coolTemp <= TARGET_HOLD_TEMP + 2.0) {
+        // Once temperature is within +/- 1.0C of target, initiate holding time clock
+        if (coolTemp >= TARGET_HOLD_TEMP - 1.0 && coolTemp <= TARGET_HOLD_TEMP + 1.0) {
            phaseTimerActive = true;
            phaseStartTime = millis();
         }
