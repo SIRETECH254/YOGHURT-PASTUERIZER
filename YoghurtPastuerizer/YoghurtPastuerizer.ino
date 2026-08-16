@@ -163,16 +163,14 @@ void loop() {
       break;
         
     case HOLDING:
-      // ACTUATORS: HEATER AND COOLER, CASCADE-CONTROLLED OFF THE JACKET PROBE
-      // (see runHoldingControl() in control_heater.cpp for why this replaced
-      // the old product-probe-only duty-cycle timer)
+      // ACTUATORS: HEATER AND COOLER CONTROLLED ENTIRELY OFF THE JACKET PROBE (THERMAL BLANKET)
       digitalWrite(RELAY_AGITATOR_PIN, HIGH); // Force Agitator OFF
-      runHoldingControl(heatTemp, coolTemp, TARGET_HOLD_TEMP);
+      runHoldingControl(heatTemp, TARGET_HOLD_TEMP);
 
-      // Countdown time handling
+      // Countdown time handling - JACKET DRIVEN
       if (!phaseTimerActive) {
-        // Once temperature is within +/- 1.0C of target, initiate holding time clock
-        if (coolTemp >= TARGET_HOLD_TEMP - 1.0 && coolTemp <= TARGET_HOLD_TEMP + 1.0) {
+        // Once JACKET temperature reaches within +/- 1.0C of target, initiate holding time clock
+        if (heatTemp >= TARGET_HOLD_TEMP - 1.0 && heatTemp <= TARGET_HOLD_TEMP + 1.0) {
            phaseTimerActive = true;
            phaseStartTime = millis();
         }
@@ -219,14 +217,6 @@ void loop() {
   if (millis() - lastHeartbeat >= 1000) {
     lastHeartbeat = millis();
 
-    // Elapsed time into the current phase's duration countdown (0 until the
-    // phase's own start condition is met, e.g. HOLDING waits for +/-2C first)
-    // rather than raw seconds-since-boot -- much more useful for an 8-hour hold.
-    unsigned long phaseElapsedSec = phaseTimerActive ? (millis() - phaseStartTime) / 1000 : 0;
-    unsigned long hh = phaseElapsedSec / 3600;
-    unsigned long mm = (phaseElapsedSec % 3600) / 60;
-    unsigned long ss = phaseElapsedSec % 60;
-
     // Relays are active-low; digitalRead() on an OUTPUT pin reads back what
     // we last wrote, so this reflects the actual actuator state right now.
     bool heaterOn   = (digitalRead(RELAY_HEATER_PIN)   == LOW);
@@ -235,15 +225,6 @@ void loop() {
 
     Serial.print("[state=");
     Serial.print(currentState);
-    Serial.print(" phase_elapsed=");
-    if (hh < 10) Serial.print('0');
-    Serial.print(hh);
-    Serial.print(':');
-    if (mm < 10) Serial.print('0');
-    Serial.print(mm);
-    Serial.print(':');
-    if (ss < 10) Serial.print('0');
-    Serial.print(ss);
     Serial.print("] jacket=");
     Serial.print(heatTemp, 1);
     Serial.print("C product=");

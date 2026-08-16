@@ -101,93 +101,61 @@ void runCoolingControl(float currentTemp, float targetTemp) {
 }
 
 // -------------------------------------------------------------------------
-// Holding-phase "Thermal Blanket" control
+// Holding-phase "Thermal Blanket" control (Pure Jacket-Driven)
 //
-// Philosophy: keep the jacket at ~TARGET temperature at all times. If the
-// jacket is at 43C, the milk physically cannot drift far from 43C,
-// regardless of probe lag or lack of agitation. The product probe
-// provides a slow trim bias (+/-1C max) to the jacket setpoint to
-// compensate for systematic ambient heat loss.
+// Philosophy: Keep the water jacket maintained right at target temperature
+// (e.g. 43C). Because the milk is surrounded by this thermal blanket, it
+// equalises to target naturally without needing slow probe interference.
 //
-// Three layers:
-//   1. Product trim  -- biases the jacket setpoint by +/-1C max
-//   2. Jacket dead band -- relay only fires when jacket drifts meaningfully
-//   3. Committed switching -- relay stays ON until jacket is restored past
-//      setpoint, with a hard minimum dwell time to cap switching rate
-//
-// Expected behaviour: ~3-4 relay switches per hour (heater top-ups).
-// Cooler fires rarely (only if product enters holding above target).
+// Control Rules:
+//   - Heater turns ON if jacket drops below (target - HOLD_HEATER_HYSTERESIS).
+//   - Heater turns OFF once jacket reaches target.
+//   - Cooler turns ON if jacket rises above (target + HOLD_COOLER_HYSTERESIS).
+//   - Cooler turns OFF once jacket drops back down to target.
+//   - Coasting band between (target - 1.0) and (target + 1.0): Both OFF.
+//   - HOLD_MIN_DWELL_MS (30s) prevents relay chatter/cracking.
 // -------------------------------------------------------------------------
 
-const float HOLD_JACKET_DEADBAND          = 1.0;    // Jacket must drift this far from setpoint before relay fires
-const float HOLD_JACKET_RESTORE           = 1.5;    // Relay stays ON until jacket is pushed this far past setpoint
-const float HOLD_PRODUCT_DEADBAND         = 0.5;    // Product dead band -- no bias applied inside this range
-const float HOLD_PRODUCT_BIAS_MAX         = 1.0;    // Max bias on jacket setpoint (caps jacket to TARGET +/- 1C)
+const float HOLD_HEATER_HYSTERESIS        = 1.0;    // Turn heater ON if jacket <= target - 1.0C
+const float HOLD_COOLER_HYSTERESIS        = 1.0;    // Turn cooler ON if jacket >= target + 1.0C
 const unsigned long HOLD_MIN_DWELL_MS     = 30000;  // Hard min dwell: relay locked for 30s after any state change
 
-void runHoldingControl(float jacketTemp, float productTemp, float targetTemp) {
+void runHoldingControl(float jacketTemp, float targetTemp) {
   static bool heaterOn = false;
   static bool coolerOn = false;
   static unsigned long lastSwitchTime = 0;
 
-  // === LAYER 1: Product Trim (slow, gentle jacket setpoint bias) ===
-  float productError = targetTemp - productTemp;  // positive = product is cold
-  float productBias = 0.0;
-
-  if (productError > HOLD_PRODUCT_DEADBAND) {
-    // Product is cold -- nudge jacket setpoint warmer
-    productBias = min(productError, HOLD_PRODUCT_BIAS_MAX);
-  } else if (productError < -HOLD_PRODUCT_DEADBAND) {
-    // Product is hot -- nudge jacket setpoint cooler
-    productBias = max(productError, -HOLD_PRODUCT_BIAS_MAX);
-  }
-  // else: product within dead band -- no bias, jacket stays at target
-
-  // === LAYER 2: Jacket Setpoint (always 42C - 44C) ===
-  float jacketSetpoint = targetTemp + productBias;
-
-  // === LAYER 3: Relay Control (committed bang-bang with dead band) ===
-  float jacketError = jacketSetpoint - jacketTemp;  // positive = jacket is cold
-
   bool wantHeaterOn = heaterOn;
   bool wantCoolerOn = coolerOn;
 
-  if (jacketError > 0) {
-    // Jacket is below setpoint -- may need heating
-    wantCoolerOn = false;
-    if (!heaterOn) {
-      // Only trigger if jacket has drifted meaningfully below setpoint
-      wantHeaterOn = (jacketError >= HOLD_JACKET_DEADBAND);
-    } else {
-      // Already heating -- stay ON until jacket is restored well past setpoint
-      wantHeaterOn = true;  // stay committed -- checked below in the overshoot path
+  // Heater control
+  if (heaterOn) {
+    if (jacketTemp >= targetTemp) {
+      wantHeaterOn = false; // Reached target, turn heater OFF and coast
     }
   } else {
-    // Jacket is at or above setpoint
-    float jacketOvershoot = -jacketError;  // positive = how far above setpoint
-
-    if (heaterOn) {
-      // Heating -- turn off once jacket has been restored past setpoint
-      wantHeaterOn = (jacketOvershoot < HOLD_JACKET_RESTORE) ? true : false;
-    } else {
-      wantHeaterOn = false;
-    }
-
-    // May need cooling if jacket is significantly above setpoint
-    if (!coolerOn) {
-      wantCoolerOn = (jacketOvershoot >= HOLD_JACKET_DEADBAND);
-    } else {
-      // Already cooling -- stay committed until jacket drops back below setpoint
-      wantCoolerOn = (jacketOvershoot > 0);  // stay on while still above setpoint
+    if (jacketTemp <= targetTemp - HOLD_HEATER_HYSTERESIS) {
+      wantHeaterOn = true;  // Dropped below deadband, turn heater ON
     }
   }
 
-  // Never run heater and cooler simultaneously
+  // Cooler control (safety/upper guard)
+  if (coolerOn) {
+    if (jacketTemp <= targetTemp) {
+      wantCoolerOn = false; // Brought back down to target, turn cooler OFF
+    }
+  } else {
+    if (jacketTemp >= targetTemp + HOLD_COOLER_HYSTERESIS) {
+      wantCoolerOn = true;  // Rose above deadband, turn cooler ON
+    }
+  }
+
+  // Interlock: never allow heater and cooler to run simultaneously
   if (wantHeaterOn && wantCoolerOn) {
     wantCoolerOn = false;
   }
 
-  // === DWELL GUARD: Hard rate limiter ===
+  // Dwell guard: enforce minimum time before relay can change state (no cracking)
   unsigned long now = millis();
   if ((wantHeaterOn != heaterOn || wantCoolerOn != coolerOn) &&
       (now - lastSwitchTime >= HOLD_MIN_DWELL_MS)) {
