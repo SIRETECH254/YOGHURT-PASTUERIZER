@@ -101,69 +101,75 @@ void runCoolingControl(float currentTemp, float targetTemp) {
 }
 
 // -------------------------------------------------------------------------
-// Holding-phase "Thermal Blanket" control (Pure Jacket-Driven)
+// Holding-phase "Time-Proportional" Duty Cycle Control (Jacket-Driven)
 //
-// Philosophy: Keep the water jacket maintained right at target temperature
-// (e.g. 43C). Because the milk is surrounded by this thermal blanket, it
-// equalises to target naturally without needing slow probe interference.
+// Period Window: 60 Seconds (60,000 ms)
 //
-// Control Rules:
-//   - Heater turns ON if jacket drops below (target - HOLD_HEATER_HYSTERESIS).
-//   - Heater turns OFF once jacket reaches target.
-//   - Cooler turns ON if jacket rises above (target + HOLD_COOLER_HYSTERESIS).
-//   - Cooler turns OFF once jacket drops back down to target.
-//   - Coasting band between (target - 1.0) and (target + 1.0): Both OFF.
-//   - HOLD_MIN_DWELL_MS (30s) prevents relay chatter/cracking.
+// Stepped Duty Cycle based on Temperature Deviation from target:
+//   - Deviation <= 1.0C : Rest zone (0s / 60s -> Actuators OFF)
+//   - Deviation >= 2.0C : 10s ON / 60s
+//   - Deviation >= 3.0C : 15s ON / 60s
+//   - Deviation >= 4.0C : 25s ON / 60s
+//   - Deviation >= 5.0C : 60s ON / 60s (Fully OPEN / Continuous ON)
+//
+// Anti-Cracking Protection:
+//   - The duty duration is evaluated and latched at the start of each 60s
+//     window so sensor noise at boundary thresholds cannot chatter the relay.
+//   - Max switches per minute = 2 (one ON, one OFF).
 // -------------------------------------------------------------------------
 
-const float HOLD_HEATER_HYSTERESIS        = 1.0;    // Turn heater ON if jacket <= target - 1.0C
-const float HOLD_COOLER_HYSTERESIS        = 1.0;    // Turn cooler ON if jacket >= target + 1.0C
-const unsigned long HOLD_MIN_DWELL_MS     = 30000;  // Hard min dwell: relay locked for 30s after any state change
+const unsigned long HOLD_CYCLE_PERIOD_MS = 60000UL; // 60-second cycle period
 
 void runHoldingControl(float jacketTemp, float targetTemp) {
-  static bool heaterOn = false;
-  static bool coolerOn = false;
-  static unsigned long lastSwitchTime = 0;
+  static unsigned long windowStartTime = 0;
+  static unsigned long latchedOnDurationMs = 0;
+  static int latchedMode = 0; // 0 = rest, 1 = heat, 2 = cool
 
-  bool wantHeaterOn = heaterOn;
-  bool wantCoolerOn = coolerOn;
-
-  // Heater control
-  if (heaterOn) {
-    if (jacketTemp >= targetTemp) {
-      wantHeaterOn = false; // Reached target, turn heater OFF and coast
-    }
-  } else {
-    if (jacketTemp <= targetTemp - HOLD_HEATER_HYSTERESIS) {
-      wantHeaterOn = true;  // Dropped below deadband, turn heater ON
-    }
-  }
-
-  // Cooler control (safety/upper guard)
-  if (coolerOn) {
-    if (jacketTemp <= targetTemp) {
-      wantCoolerOn = false; // Brought back down to target, turn cooler OFF
-    }
-  } else {
-    if (jacketTemp >= targetTemp + HOLD_COOLER_HYSTERESIS) {
-      wantCoolerOn = true;  // Rose above deadband, turn cooler ON
-    }
-  }
-
-  // Interlock: never allow heater and cooler to run simultaneously
-  if (wantHeaterOn && wantCoolerOn) {
-    wantCoolerOn = false;
-  }
-
-  // Dwell guard: enforce minimum time before relay can change state (no cracking)
   unsigned long now = millis();
-  if ((wantHeaterOn != heaterOn || wantCoolerOn != coolerOn) &&
-      (now - lastSwitchTime >= HOLD_MIN_DWELL_MS)) {
-    heaterOn = wantHeaterOn;
-    coolerOn = wantCoolerOn;
-    lastSwitchTime = now;
+
+  // Evaluate and lock the duty cycle decision at the beginning of each 60-second cycle
+  if (now - windowStartTime >= HOLD_CYCLE_PERIOD_MS || windowStartTime == 0) {
+    windowStartTime = now;
+
+    float error = targetTemp - jacketTemp; // positive = cold (needs heat), negative = hot (needs cool)
+    float dev = abs(error);
+
+    if (dev >= 5.0) {
+      latchedOnDurationMs = 60000UL; // Fully ON (60s / 60s)
+    } else if (dev >= 4.0) {
+      latchedOnDurationMs = 25000UL; // 25s / 60s
+    } else if (dev >= 3.0) {
+      latchedOnDurationMs = 15000UL; // 15s / 60s
+    } else if (dev >= 2.0) {
+      latchedOnDurationMs = 10000UL; // 10s / 60s
+    } else {
+      latchedOnDurationMs = 0;       // <= 1.0C Rest zone (0s / 60s)
+    }
+
+    if (latchedOnDurationMs > 0) {
+      latchedMode = (error > 0) ? 1 : 2; // 1 = Heat, 2 = Cool
+    } else {
+      latchedMode = 0; // Rest
+    }
   }
 
+  unsigned long windowElapsed = now - windowStartTime;
+
+  bool heaterOn = false;
+  bool coolerOn = false;
+
+  // Active during the latched ON window
+  if (latchedMode != 0 && windowElapsed < latchedOnDurationMs) {
+    if (latchedMode == 1) {
+      heaterOn = true;
+      coolerOn = false;
+    } else if (latchedMode == 2) {
+      coolerOn = true;
+      heaterOn = false;
+    }
+  }
+
+  // Active-low relay output (LOW = ON, HIGH = OFF)
   digitalWrite(RELAY_HEATER_PIN, heaterOn ? LOW : HIGH);
   digitalWrite(RELAY_COOLING_PIN, coolerOn ? LOW : HIGH);
 }
