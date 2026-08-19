@@ -77,23 +77,29 @@ void runPIDControl(float currentTemp, float targetTemp) {
 }
 
 // -------------------------------------------------------------------------
-// Same jacket-driven approach, mirrored for cooling. Same hysteresis logic
-// as runPIDControl() above, for the same chatter-prevention reason.
+// Product-driven cooling control:
+// To prevent thermal overshoot (where cold jacket water in the walls keeps
+// pulling heat and over-chills the milk into the 30s), the cooling valve is
+// cut off when the product reaches (targetTemp + COOL_EARLY_CUTOFF).
+// The agitator remains running to let residual jacket cold bring the product
+// smoothly down to the exact target.
 // -------------------------------------------------------------------------
-const float COOL_HYSTERESIS = 1.0; // Dead zone above target before the valve is allowed back on
+const float COOL_EARLY_CUTOFF = 5.0; // Cut off valve 5C before target to prevent thermal overshoot
+const float COOL_HYSTERESIS   = 1.0; // Dead zone above cutoff threshold before valve can re-engage
 
-void runCoolingControl(float currentTemp, float targetTemp) {
-  static bool coolerOn = true; // Cooling always starts well above target, so default to ON
+void runCoolingControl(float currentProductTemp, float targetTemp) {
+  static bool coolerOn = true; // Cooling starts well above target, default to ON
 
-  float error = currentTemp - targetTemp; // positive while still above target
+  float cutoffThreshold = targetTemp + COOL_EARLY_CUTOFF;
+  float error = currentProductTemp - cutoffThreshold; // > 0 while product is still above cutoff threshold
 
   if (coolerOn) {
     if (error <= 0) {
-      coolerOn = false; // Jacket reached/passed target: stop, let product catch up
+      coolerOn = false; // Product reached target + 5C: cut off valve and coast down
     }
   } else {
     if (error > COOL_HYSTERESIS) {
-      coolerOn = true; // Jacket rose back out past the hysteresis margin: allow it back on
+      coolerOn = true; // Product temperature rose above cutoff + hysteresis: turn valve back on
     }
   }
 
