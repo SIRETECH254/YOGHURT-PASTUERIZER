@@ -43,7 +43,8 @@ void setup() {
 }
 
 void transitionToNextState(ProcessState nextAutoState) {
-  turnOffAllActuators(); // Ensures everything is dead before the next phase turns anything on
+  turnOffAllActuators(true); // Ensures everything is dead before the next phase turns anything on
+  resetActuatorControl();
   resetPhaseTimer();
   if (currentMode == MODE_AUTO) {
     currentState = nextAutoState;
@@ -62,22 +63,15 @@ void loop() {
   float heatTemp = readHeatingTemperature(); 
   float coolTemp = readCoolingTemperature(); 
 
-  // Track consecutive sensor faults to filter out single-frame EMI relay noise spikes
-  static int consecutiveFaults = 0;
+  // Emergency safety check: if sensors return 999.0 (sustained disconnection confirmed)
   if (heatTemp >= 999.0 || coolTemp >= 999.0) {
-    consecutiveFaults++;
-  } else {
-    consecutiveFaults = 0; // Reset counter on valid reading
-  }
-
-  // Only trigger emergency stop if the sensor fault is solid and continuous (10 loops = approx 1 second)
-  if (consecutiveFaults >= 10) {
     Serial.println("CRITICAL: Sustained sensor disconnection detected! Tripping emergency safety...");
     currentState = FAULT_ERROR;
   }
   
   // 1. DEBUNCED PHYSICAL BUTTON CHECK
   if (startButtonPressed()) {
+    resetActuatorControl();
     if (currentMenuState == SCREEN_AUTO_READY) {
       currentState = HEATING;
       currentMenuState = SCREEN_RUNNING;
@@ -99,19 +93,18 @@ void loop() {
   // 3. CORE STATE MACHINE ENGINE
   switch(currentState) {
     case SYSTEM_IDLE:
-      turnOffAllActuators();
+      turnOffAllActuators(false);
       resetPhaseTimer();
-      consecutiveFaults = 0;
       break;
         
     case HEATING:
       // ACTUATORS: HEATER AND AGITATOR
       turnOnAgitator();                       // Agitator ON during heating to ensure uniform mixture
-      digitalWrite(RELAY_COOLING_PIN, HIGH);  // Force Cooling Valve OFF
+      setCoolingRelay(false);                 // Force Cooling Valve OFF
       
       runPIDControl(heatTemp, TARGET_HEAT_TEMP);
       
-      // Safety Override: Throttle/turn off heater if jacket gets too hot, but DO NOT fault brick the machine
+      // Safety Override: Throttle heater if jacket approaches max safe limit (105°C)
       if (heatTemp >= (MAX_SAFE_TEMP - 5.0)) {
         turnOffHeater(); 
       }
@@ -149,7 +142,7 @@ void loop() {
     case MIXING:
       // ACTUATOR: AGITATOR ONLY
       turnOffHeater();                        // Force Heater OFF
-      digitalWrite(RELAY_COOLING_PIN, HIGH);  // Force Cooling Valve OFF
+      setCoolingRelay(false);                 // Force Cooling Valve OFF
       turnOnAgitator();                       // Turn Agitator ON
       
       if (!phaseTimerActive) {
@@ -163,14 +156,14 @@ void loop() {
       break;
         
     case HOLDING:
-      // ACTUATORS: HEATER AND COOLER CONTROLLED ENTIRELY OFF THE JACKET PROBE (THERMAL BLANKET)
-      digitalWrite(RELAY_AGITATOR_PIN, HIGH); // Force Agitator OFF
-      runHoldingControl(heatTemp, TARGET_HOLD_TEMP);
+      // ACTUATORS: HEATER CONTROLLED OFF PRODUCT CORE WITH JACKET SAFETY CAP
+      setAgitatorRelay(false);                // Force Agitator OFF (undisturbed incubation)
+      runHoldingControl(coolTemp, heatTemp, TARGET_HOLD_TEMP);
 
-      // Countdown time handling - JACKET DRIVEN
+      // Countdown time handling - PRODUCT DRIVEN
       if (!phaseTimerActive) {
-        // Once JACKET temperature reaches within +/- 1.0C of target, initiate holding time clock
-        if (heatTemp >= TARGET_HOLD_TEMP - 1.0 && heatTemp <= TARGET_HOLD_TEMP + 1.0) {
+        // Once PRODUCT temperature reaches within +/- 1.0C of target, initiate holding time clock
+        if (coolTemp >= TARGET_HOLD_TEMP - 1.0 && coolTemp <= TARGET_HOLD_TEMP + 1.0) {
            phaseTimerActive = true;
            phaseStartTime = millis();
         }
@@ -182,7 +175,7 @@ void loop() {
       break;
 
     case COMPLETE:
-      turnOffAllActuators();
+      turnOffAllActuators(false);
       soundBuzzer();
       break;
         
@@ -192,7 +185,8 @@ void loop() {
          currentState = SYSTEM_IDLE;
          currentMode = MODE_NONE;
          currentMenuState = SCREEN_HOME; 
-         turnOffAllActuators(); 
+         turnOffAllActuators(true); 
+         resetActuatorControl();
          clearRunState(); // Operator acknowledged the stop -- nothing to resume
       }
       break;

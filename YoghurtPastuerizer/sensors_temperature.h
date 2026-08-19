@@ -8,5 +8,9 @@ void initTemperatureSensor();
 void runSensorDiagnostics(); 
 float readHeatingTemperature(); 
 float readCoolingTemperature(); 
+float readRawHeatingTemperature();
+float readRawCoolingTemperature();
+void resetSensorFilters();
 
 #endif
+

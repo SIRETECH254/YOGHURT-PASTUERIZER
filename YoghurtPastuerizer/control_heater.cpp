@@ -4,6 +4,34 @@
 #include "control_heater.h"
 #include "config_settings.h"
 
+// -------------------------------------------------------------------------
+// ANTI-CHATTER & ACTUATOR PROTECTION TIMERS
+// Physical relays, contactors, and solenoid valve coils will burn out if
+// rapidly switched. These dwell times enforce minimum ON and OFF run times.
+// -------------------------------------------------------------------------
+const unsigned long MIN_HEATER_DWELL_MS   = 6000UL; // 6s minimum ON/OFF time for heating element
+const unsigned long MIN_COOLER_DWELL_MS   = 3500UL; // 3.5s minimum ON/OFF dwell time to allow 4s pulses
+const unsigned long MIN_AGITATOR_DWELL_MS = 3000UL; // 3s minimum ON/OFF time for agitator motor
+
+static bool heaterState = false;
+static unsigned long lastHeaterSwitchTime = 0;
+
+static bool coolerState = false;
+static unsigned long lastCoolerSwitchTime = 0;
+
+static bool agitatorState = false;
+static unsigned long lastAgitatorSwitchTime = 0;
+
+// Internal state tracking for phase controllers
+static bool heatingDemand = true;
+static bool coolingDemand = true;
+
+static unsigned long holdWindowStartTime = 0;
+static unsigned long holdHeaterPulseDuration = 0;
+static bool holdCoolingPulseActive = false;
+static unsigned long holdCoolingPulseStartTime = 0;
+static unsigned long lastHoldCoolPulseEndTime = 0;
+
 void initHeater() {
   // Set output pins HIGH before configuration to keep active-low relays from pulsing on boot
   digitalWrite(RELAY_HEATER_PIN, HIGH);   
@@ -19,163 +47,248 @@ void initHeater() {
   pinMode(BUTTON_START_PIN, INPUT_PULLUP);
   pinMode(BUTTON_STOP_PIN, INPUT_PULLUP);
   
-  turnOffAllActuators();
+  turnOffAllActuators(true);
+}
+
+// -------------------------------------------------------------------------
+// SAFE RELAY DRIVERS (Hardware protection layer)
+// All relay activations must pass through these functions to guarantee
+// that no relay chattering or rapid clicking can occur.
+// -------------------------------------------------------------------------
+void setHeaterRelay(bool on, bool forceImmediate) {
+  if (forceImmediate) {
+    heaterState = false;
+    lastHeaterSwitchTime = millis();
+    digitalWrite(RELAY_HEATER_PIN, HIGH); // Active-low: HIGH turns OFF
+    return;
+  }
+
+  if (on == heaterState) return;
+
+  unsigned long now = millis();
+  if (now - lastHeaterSwitchTime >= MIN_HEATER_DWELL_MS || lastHeaterSwitchTime == 0) {
+    heaterState = on;
+    lastHeaterSwitchTime = now;
+    digitalWrite(RELAY_HEATER_PIN, on ? LOW : HIGH); // Active-low: LOW turns ON
+  }
+}
+
+void setCoolingRelay(bool on, bool forceImmediate) {
+  if (forceImmediate) {
+    coolerState = false;
+    lastCoolerSwitchTime = millis();
+    digitalWrite(RELAY_COOLING_PIN, HIGH); // Active-low: HIGH turns OFF
+    return;
+  }
+
+  if (on == coolerState) return;
+
+  unsigned long now = millis();
+  if (now - lastCoolerSwitchTime >= MIN_COOLER_DWELL_MS || lastCoolerSwitchTime == 0) {
+    coolerState = on;
+    lastCoolerSwitchTime = now;
+    digitalWrite(RELAY_COOLING_PIN, on ? LOW : HIGH); // Active-low: LOW turns ON
+  }
+}
+
+void setAgitatorRelay(bool on, bool forceImmediate) {
+  if (forceImmediate) {
+    agitatorState = false;
+    lastAgitatorSwitchTime = millis();
+    digitalWrite(RELAY_AGITATOR_PIN, HIGH); // Active-low: HIGH turns OFF
+    return;
+  }
+
+  if (on == agitatorState) return;
+
+  unsigned long now = millis();
+  if (now - lastAgitatorSwitchTime >= MIN_AGITATOR_DWELL_MS || lastAgitatorSwitchTime == 0) {
+    agitatorState = on;
+    lastAgitatorSwitchTime = now;
+    digitalWrite(RELAY_AGITATOR_PIN, on ? LOW : HIGH); // Active-low: LOW turns ON
+  }
 }
 
 void turnOnAgitator() { 
-  digitalWrite(RELAY_AGITATOR_PIN, LOW); // LOW turns active-low relay ON
+  setAgitatorRelay(true);
 }
 
-void turnOffHeater() { 
-  digitalWrite(RELAY_HEATER_PIN, HIGH); // HIGH turns active-low relay OFF
+void turnOffHeater(bool forceImmediate) { 
+  setHeaterRelay(false, forceImmediate);
 }
 
 void turnOnCoolingValve() { 
-  digitalWrite(RELAY_COOLING_PIN, LOW); // LOW turns active-low cooling valve ON
+  setCoolingRelay(true);
 }
 
-void turnOffAllActuators() {
-  digitalWrite(RELAY_HEATER_PIN, HIGH);   
-  digitalWrite(RELAY_AGITATOR_PIN, HIGH); 
-  digitalWrite(RELAY_COOLING_PIN, HIGH);  
+void turnOffAllActuators(bool forceImmediate) {
+  setHeaterRelay(false, forceImmediate);
+  setCoolingRelay(false, forceImmediate);
+  setAgitatorRelay(false, forceImmediate);
   digitalWrite(BUZZER_PIN, LOW);         
 }
 
-// -------------------------------------------------------------------------
-// Jacket-driven control: the jacket probe responds almost immediately to
-// the relay, so the heater is cut off exactly when the JACKET reaches
-// target -- no more guessing an early cutoff band based on the slow,
-// laggy product probe. The product is left to passively catch up to the
-// jacket via conduction after cutoff (phase completion/display still watch
-// the product probe separately, in the .ino).
-//
-// HEAT_HYSTERESIS exists to stop relay chatter: without it, normal probe
-// noise right at the exact target causes `error` to bounce back and forth
-// across zero, so the relay follows every bounce and clicks rapidly. With
-// hysteresis, once the heater turns off at target, it won't turn back on
-// until the jacket temp drops a further 1C below target -- a small amount
-// of noise can no longer re-trigger it.
-// -------------------------------------------------------------------------
-const float HEAT_HYSTERESIS = 1.0; // Dead zone below target before the heater is allowed back on
-
-void runPIDControl(float currentTemp, float targetTemp) {
-  static bool heaterOn = true; // Heating always starts well below target, so default to ON
-
-  float error = targetTemp - currentTemp;
-
-  if (heaterOn) {
-    if (error <= 0) {
-      heaterOn = false; // Jacket reached/passed target: stop, let product catch up
-    }
-  } else {
-    if (error > HEAT_HYSTERESIS) {
-      heaterOn = true; // Jacket dropped back out past the hysteresis margin: allow it back on
-    }
-  }
-
-  digitalWrite(RELAY_HEATER_PIN, heaterOn ? LOW : HIGH);
+void resetActuatorControl() {
+  heatingDemand = true;
+  coolingDemand = true;
+  holdWindowStartTime = 0;
+  holdHeaterPulseDuration = 0;
+  holdCoolingPulseActive = false;
+  holdCoolingPulseStartTime = 0;
+  lastHoldCoolPulseEndTime = 0;
 }
 
 // -------------------------------------------------------------------------
-// Product-driven cooling control:
-// To prevent thermal overshoot (where cold jacket water in the walls keeps
-// pulling heat and over-chills the milk into the 30s), the cooling valve is
-// cut off when the product reaches (targetTemp + COOL_EARLY_CUTOFF).
-// The agitator remains running to let residual jacket cold bring the product
-// smoothly down to the exact target.
+// HEATING PHASE: Jacket-driven control with 2.0°C hysteresis + dwell safety
+//
+// The jacket probe responds rapidly to the heating element. The heater turns
+// OFF immediately when the JACKET reaches the target temperature.
+// To eliminate clicking/chattering, a 2.0°C hysteresis deadband and the 6s
+// minimum dwell timer ensure that small analog noise or rapid thermal ripples
+// cannot re-trigger the relay until temperature drops cleanly below target.
+// -------------------------------------------------------------------------
+const float HEAT_HYSTERESIS = 2.0; // 2.0C dead zone below target before heater can turn back on
+
+void runPIDControl(float jacketTemp, float targetTemp) {
+  // Jacket reached or exceeded target: turn heater demand OFF
+  if (jacketTemp >= targetTemp) {
+    heatingDemand = false;
+  }
+  // Only turn heater demand back ON once jacket temperature drops below (target - hysteresis)
+  else if (jacketTemp <= (targetTemp - HEAT_HYSTERESIS)) {
+    heatingDemand = true;
+  }
+
+  setHeaterRelay(heatingDemand);
+}
+
+// -------------------------------------------------------------------------
+// COOLING PHASE: Product-driven cooling with 2.0°C hysteresis + dwell safety
+//
+// To prevent thermal overshoot (cold jacket water pulling heat past the
+// target), the cooling valve cuts off when the product reaches
+// (targetTemp + COOL_EARLY_CUTOFF). The agitator continues running to let
+// residual jacket cold bring product smoothly down to target.
 // -------------------------------------------------------------------------
 const float COOL_EARLY_CUTOFF = 5.0; // Cut off valve 5C before target to prevent thermal overshoot
-const float COOL_HYSTERESIS   = 1.0; // Dead zone above cutoff threshold before valve can re-engage
+const float COOL_HYSTERESIS   = 2.0; // 2.0C dead zone above cutoff before valve can re-engage
 
-void runCoolingControl(float currentProductTemp, float targetTemp) {
-  static bool coolerOn = true; // Cooling starts well above target, default to ON
+void runCoolingControl(float productTemp, float targetTemp) {
+  float cutoffThreshold = targetTemp + COOL_EARLY_CUTOFF; // e.g. 45.0 + 5.0 = 50.0C
 
-  float cutoffThreshold = targetTemp + COOL_EARLY_CUTOFF;
-  float error = currentProductTemp - cutoffThreshold; // > 0 while product is still above cutoff threshold
-
-  if (coolerOn) {
-    if (error <= 0) {
-      coolerOn = false; // Product reached target + 5C: cut off valve and coast down
-    }
-  } else {
-    if (error > COOL_HYSTERESIS) {
-      coolerOn = true; // Product temperature rose above cutoff + hysteresis: turn valve back on
-    }
+  // Product reached or dropped below cutoff: close valve
+  if (productTemp <= cutoffThreshold) {
+    coolingDemand = false;
+  }
+  // Only re-open valve if product temperature warms back up past cutoff + hysteresis
+  else if (productTemp >= (cutoffThreshold + COOL_HYSTERESIS)) {
+    coolingDemand = true;
   }
 
-  digitalWrite(RELAY_COOLING_PIN, coolerOn ? LOW : HIGH);
+  setCoolingRelay(coolingDemand);
 }
 
 // -------------------------------------------------------------------------
-// Holding-phase "Time-Proportional" Duty Cycle Control (Jacket-Driven)
+// HOLDING PHASE: Controlled Incubation with Strict Pulsed Cooling Relief
 //
-// Period Window: 60 Seconds (60,000 ms)
+// 1. Rest Zone (Normal Incubation: target - 1.0°C <= Product <= target + 2.0°C):
+//    Both Heater and Cooling Valve remain completely OFF.
+//    At 43.0°C (for 43°C - 45°C setpoint), system is in the Rest Zone (0% cooling).
 //
-// Stepped Duty Cycle based on Temperature Deviation from target:
-//   - Deviation <= 1.0C : Rest zone (0s / 60s -> Actuators OFF)
-//   - Deviation >= 2.0C : 10s ON / 60s
-//   - Deviation >= 3.0C : 15s ON / 60s
-//   - Deviation >= 4.0C : 25s ON / 60s
-//   - Deviation >= 5.0C : 60s ON / 60s (Fully OPEN / Continuous ON)
+// 2. Heating Maintenance: Product < (target - 1.0°C) AND Jacket < 46.0°C:
+//    Applies a smooth, gentle heat pulse (15s ON / 60s window).
+//    Cut off immediately if jacket reaches 46.0°C or product recovers.
 //
-// Anti-Cracking Protection:
-//   - The duty duration is evaluated and latched at the start of each 60s
-//     window so sensor noise at boundary thresholds cannot chatter the relay.
-//   - Max switches per minute = 2 (one ON, one OFF).
+// 3. Emergency Cooling Relief: Product >= (target + 2.5°C) ONLY:
+//    STRICTLY PULSED: 4 seconds of every minute (4s ON / 56s rest).
+//    Jacket temperature alone NEVER triggers cooling.
+//
+// 4. Agitator: Remains OFF to let yoghurt curd set undisturbed.
 // -------------------------------------------------------------------------
+const float HOLD_HEAT_TRIGGER_OFFSET  = 1.0;     // Heat starts when Product < (target - 1.0C) (e.g. < 42.0C)
+const float HOLD_COOL_TRIGGER_OFFSET  = 2.5;     // Cool relief ONLY if Product >= (target + 2.5C) (e.g. >= 45.5C)
+const float JACKET_HOLD_HEAT_LIMIT    = 46.0;    // Heater cut off if jacket reaches 46.0C to prevent overshoot
+const unsigned long HOLD_HEAT_WINDOW_MS  = 60000UL;  // 60-second heat cycle window
+const unsigned long HOLD_COOL_PULSE_MS   = 10000UL;   // Exactly 10 seconds cold pulse
+const unsigned long HOLD_COOL_LOCKOUT_MS = 50000UL;  // 50 seconds rest (4s ON + 56s rest = 1 pulse of 4s every minute)
 
-const unsigned long HOLD_CYCLE_PERIOD_MS = 60000UL; // 60-second cycle period
-
-void runHoldingControl(float jacketTemp, float targetTemp) {
-  static unsigned long windowStartTime = 0;
-  static unsigned long latchedOnDurationMs = 0;
-  static int latchedMode = 0; // 0 = rest, 1 = heat, 2 = cool
-
+void runHoldingControl(float productTemp, float jacketTemp, float targetTemp) {
   unsigned long now = millis();
 
-  // Evaluate and lock the duty cycle decision at the beginning of each 60-second cycle
-  if (now - windowStartTime >= HOLD_CYCLE_PERIOD_MS || windowStartTime == 0) {
-    windowStartTime = now;
+  // =========================================================================
+  // 1. HEATING SUBSYSTEM (Maintenance)
+  // =========================================================================
+  if (now - holdWindowStartTime >= HOLD_HEAT_WINDOW_MS || holdWindowStartTime == 0) {
+    holdWindowStartTime = now;
+    holdHeaterPulseDuration = 0;
 
-    float error = targetTemp - jacketTemp; // positive = cold (needs heat), negative = hot (needs cool)
-    float dev = abs(error);
-
-    if (dev >= 5.0) {
-      latchedOnDurationMs = 60000UL; // Fully ON (60s / 60s)
-    } else if (dev >= 4.0) {
-      latchedOnDurationMs = 25000UL; // 25s / 60s
-    } else if (dev >= 3.0) {
-      latchedOnDurationMs = 15000UL; // 15s / 60s
-    } else if (dev >= 2.0) {
-      latchedOnDurationMs = 10000UL; // 10s / 60s
-    } else {
-      latchedOnDurationMs = 0;       // <= 1.0C Rest zone (0s / 60s)
-    }
-
-    if (latchedOnDurationMs > 0) {
-      latchedMode = (error > 0) ? 1 : 2; // 1 = Heat, 2 = Cool
-    } else {
-      latchedMode = 0; // Rest
+    // Only heat if PRODUCT is cold (< target - 1.0C) and jacket is safe (< 46.0C)
+    if (productTemp < (targetTemp - HOLD_HEAT_TRIGGER_OFFSET) && jacketTemp < JACKET_HOLD_HEAT_LIMIT) {
+      float deficit = (targetTemp - HOLD_HEAT_TRIGGER_OFFSET) - productTemp;
+      if (deficit >= 2.0) {
+        holdHeaterPulseDuration = 25000UL; // 25s pulse if very cold
+      } else {
+        holdHeaterPulseDuration = 15000UL; // 15s gentle maintenance pulse
+      }
     }
   }
 
-  unsigned long windowElapsed = now - windowStartTime;
+  unsigned long elapsedHeat = now - holdWindowStartTime;
+  bool wantHeater = (holdHeaterPulseDuration > 0 && elapsedHeat < holdHeaterPulseDuration);
 
-  bool heaterOn = false;
-  bool coolerOn = false;
+  // Soft safety limits for heater:
+  // - If jacket exceeds safe heat limit (46.0C), cut heater immediately
+  if (jacketTemp >= JACKET_HOLD_HEAT_LIMIT) {
+    wantHeater = false;
+  }
+  // - If product recovers into comfort zone, finish heat pulse early
+  if (productTemp >= (targetTemp - 0.2)) {
+    wantHeater = false;
+  }
 
-  // Active during the latched ON window
-  if (latchedMode != 0 && windowElapsed < latchedOnDurationMs) {
-    if (latchedMode == 1) {
-      heaterOn = true;
-      coolerOn = false;
-    } else if (latchedMode == 2) {
-      coolerOn = true;
-      heaterOn = false;
+  // =========================================================================
+  // 2. COOLING SUBSYSTEM (Strictly Pulsed: 4s of every minute - NEVER Continuous)
+  // =========================================================================
+  bool wantCooler = false;
+
+  if (holdCoolingPulseActive) {
+    // Currently executing a short cold pulse: check if pulse time (4s) expired or product cooled
+    if (now - holdCoolingPulseStartTime >= HOLD_COOL_PULSE_MS || productTemp <= (targetTemp + 1.0)) {
+      holdCoolingPulseActive = false;
+      lastHoldCoolPulseEndTime = now; // Start the 56s rest lockout (totalling 1 minute per cycle)
+      wantCooler = false;
+    } else {
+      wantCooler = true; // Continue remaining fraction of the 4s pulse
+    }
+  } else {
+    // Pulse is NOT active: cooling is OFF by default.
+    // Can only start a new 4s pulse if:
+    // 1) Product core is genuinely hot (>= target + 2.5C, e.g. >= 45.5C for 43C target)
+    // 2) The 56-second rest lockout has elapsed (1 pulse of 4s every minute)
+    bool lockoutExpired = (lastHoldCoolPulseEndTime == 0 || (now - lastHoldCoolPulseEndTime >= HOLD_COOL_LOCKOUT_MS));
+    bool productOverheated = (productTemp >= (targetTemp + HOLD_COOL_TRIGGER_OFFSET));
+
+    if (productOverheated && lockoutExpired) {
+      holdCoolingPulseActive = true;
+      holdCoolingPulseStartTime = now;
+      wantCooler = true;
+    } else {
+      wantCooler = false; // Forced 100% OFF
     }
   }
 
-  // Active-low relay output (LOW = ON, HIGH = OFF)
-  digitalWrite(RELAY_HEATER_PIN, heaterOn ? LOW : HIGH);
-  digitalWrite(RELAY_COOLING_PIN, coolerOn ? LOW : HIGH);
+  // If heating is active, cooling is unconditionally forbidden
+  if (wantHeater) {
+    wantCooler = false;
+    holdCoolingPulseActive = false;
+  }
+
+  // All outputs route through anti-chatter safe drivers (enforcing minimum dwell times)
+  setHeaterRelay(wantHeater);
+  setCoolingRelay(wantCooler);
 }
+
+
+
+
+
