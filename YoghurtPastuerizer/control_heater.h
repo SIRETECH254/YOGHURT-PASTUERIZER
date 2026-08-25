@@ -22,7 +22,7 @@ void resetActuatorControl();
 
 // Phase-specific control routines (chatter-free)
 void runPIDControl(float jacketTemp, float targetTemp);
-void runCoolingControl(float productTemp, float targetTemp);
+void runCoolingControl(float jacketTemp, float targetTemp);
 void runHoldingControl(float productTemp, float jacketTemp, float targetTemp);
 
 #endif

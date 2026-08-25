@@ -125,7 +125,7 @@ void loop() {
       // ACTUATORS: COOLING VALVE AND AGITATOR
       turnOffHeater();                        // Force Heater OFF
       turnOnAgitator();                       // Agitator ON during cooling to ensure uniform mixture
-      runCoolingControl(coolTemp, TARGET_COOL_TEMP); // Product-driven: cuts off at target + 5C to coast smoothly down
+      runCoolingControl(heatTemp, TARGET_COOL_TEMP); // Jacket-driven: valve controls based on jacket temperature
       
       if (!phaseTimerActive) {
         if (coolTemp <= TARGET_COOL_TEMP) {

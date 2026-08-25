@@ -163,25 +163,21 @@ void runPIDControl(float jacketTemp, float targetTemp) {
 }
 
 // -------------------------------------------------------------------------
-// COOLING PHASE: Product-driven cooling with 2.0°C hysteresis + dwell safety
+// COOLING PHASE: Jacket-driven cooling with dwell safety
 //
-// To prevent thermal overshoot (cold jacket water pulling heat past the
-// target), the cooling valve cuts off when the product reaches
-// (targetTemp + COOL_EARLY_CUTOFF). The agitator continues running to let
-// residual jacket cold bring product smoothly down to target.
+// The cooling valve is controlled by the jacket temperature. When the jacket
+// reaches the target temperature, the cooling valve is closed.
+// If the jacket temperature rises above the target (typically 45.0C) due to
+// heat transferred from the hot product, the cooling valve is re-opened.
 // -------------------------------------------------------------------------
-const float COOL_EARLY_CUTOFF = 5.0; // Cut off valve 5C before target to prevent thermal overshoot
-const float COOL_HYSTERESIS   = 2.0; // 2.0C dead zone above cutoff before valve can re-engage
 
-void runCoolingControl(float productTemp, float targetTemp) {
-  float cutoffThreshold = targetTemp + COOL_EARLY_CUTOFF; // e.g. 45.0 + 5.0 = 50.0C
-
-  // Product reached or dropped below cutoff: close valve
-  if (productTemp <= cutoffThreshold) {
+void runCoolingControl(float jacketTemp, float targetTemp) {
+  // Jacket reached or dropped below target: close valve
+  if (jacketTemp <= targetTemp) {
     coolingDemand = false;
   }
-  // Only re-open valve if product temperature warms back up past cutoff + hysteresis
-  else if (productTemp >= (cutoffThreshold + COOL_HYSTERESIS)) {
+  // Jacket rises above target: open valve
+  else if (jacketTemp > targetTemp) {
     coolingDemand = true;
   }
 
